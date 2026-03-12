@@ -6,6 +6,20 @@ Compatible with: **Claude Code**, **Cursor**, **OpenCode**, and other AI assista
 
 ## Skills
 
+### audiobookshelf-metadata-sync
+
+Reference guide for synchronizing metadata between audiobookshelf server and local audio files.
+
+**Features:**
+- Authentication and API token management
+- Library and item metadata retrieval
+- Metadata field mapping across formats (MP3, M4A, FLAC)
+- Batch sync patterns with deduplication
+- File-level modification tracking
+- Error handling and verification
+
+**Location:** `audiobookshelf-metadata-sync/`
+
 ### ffmpeg-audio-processing
 
 Reference guide for processing audio files with ffmpeg.
