@@ -1,6 +1,6 @@
 ---
 name: audiobookshelf-metadata-sync
-version: 1.0.0
+version: 1.0.1
 description: Use when synchronizing audiobookshelf server metadata to local audio files, or when library item metadata and embedded file metadata are inconsistent
 ---
 
@@ -190,11 +190,13 @@ Key metadata fields to sync to audio files:
 
 ### Single File Sync with ffmpeg
 
+**Important:** FFmpeg cannot edit files in-place. You MUST write to a temporary file first, then rename.
+
 ```bash
 # Read current metadata
 ffprobe -i "chapter01.m4a" -show_entries format_tags -of default=noprint_wrappers=1
 
-# Update file metadata (replace values from audiobookshelf)
+# Step 1: Write to temporary file (must use same extension for format detection)
 ffmpeg -i "chapter01.m4a" -c copy \
   -metadata title="Chapter 1" \
   -metadata artist="Author Name" \
@@ -203,12 +205,22 @@ ffmpeg -i "chapter01.m4a" -c copy \
   -metadata genre="Fiction" \
   -metadata year="2024" \
   -metadata track="1/12" \
-  -metadata comment="Description here" \
-  "chapter01_synced.m4a"
+  -y "chapter01.temp.m4a"
 
-# Replace original (after verification)
-mv "chapter01_synced.m4a" "chapter01.m4a"
+# Step 2: Verify temp file was created successfully
+if [ -f "chapter01.temp.m4a" ]; then
+  # Step 3: Replace original
+  mv "chapter01.temp.m4a" "chapter01.m4a"
+else
+  echo "ERROR: Failed to create temp file"
+  exit 1
+fi
 ```
+
+**Why temp file is required:**
+- FFmpeg error when writing directly: `FFmpeg cannot edit existing files in-place.`
+- Temp file must have correct extension (`.temp.m4a` not `.tmp`) for format detection
+- `-y` flag overwrites temp file if it exists
 
 ### Batch Sync Script Pattern
 
@@ -391,11 +403,21 @@ echo "$items" | jq -c '.results[]' | while read -r item; do
       echo "  API path: $api_path"
       echo "  Local path: $local_path"
 
-      # Update metadata with ffmpeg
-      ffmpeg -i "$local_path" -c copy \
+      # Get file extension for temp file
+      ext="${local_path##*.}"
+      temp_file="${local_path%.${ext}}.temp.${ext}"
+
+      # Update metadata: write to temp file first, then rename
+      if ffmpeg -i "$local_path" -c copy \
         -metadata title="$title" \
         -metadata artist="$author" \
-        -y "$local_path.tmp" && mv "$local_path.tmp" "$local_path"
+        -y "$temp_file" 2>/dev/null; then
+        mv "$temp_file" "$local_path"
+        echo "  Success: metadata updated"
+      else
+        echo "  ERROR: failed to update metadata"
+        rm -f "$temp_file"
+      fi
     else
       echo "WARNING: File not found at translated path: $local_path"
       echo "  Original API path: $api_path"
@@ -449,6 +471,8 @@ To avoid duplicate modifications:
 | Overwriting manually-corrected files | Verify server metadata is source of truth |
 | Assuming API paths match local paths | Always configure path prefix mappings |
 | Using hardcoded paths | Use path translation function with mappings |
+| Writing directly to original file | **FFmpeg requires temp file first** |
+| Using wrong temp extension (`.tmp`) | Use `.temp.m4a` or same extension as source |
 
 ## Error Handling
 
@@ -536,4 +560,5 @@ Since official API docs are outdated:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.0.1 | 2026-03-12 | Add temp file requirement for ffmpeg writes (ffmpeg cannot edit in-place) |
 | 1.0.0 | 2026-03-12 | Initial release: API reference, metadata mapping, path prefix translation, deduplication |
