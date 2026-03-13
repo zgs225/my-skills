@@ -1,6 +1,6 @@
 ---
 name: audiobookshelf-metadata-sync
-version: 1.0.1
+version: 1.0.2
 description: Use when synchronizing audiobookshelf server metadata to local audio files, or when library item metadata and embedded file metadata are inconsistent
 ---
 
@@ -156,6 +156,34 @@ curl -X GET "http://your-audiobookshelf-server/api/items/item-id-1" \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
+Response includes chapters information:
+```json
+{
+  "id": "item-id-1",
+  "media": {
+    "numChapters": 32,
+    "chapters": [
+      {
+        "title": "01 鲁宾逊漂流记 01",
+        "start": 0,
+        "end": 1262.948
+      },
+      {
+        "title": "02 鲁宾逊漂流记 02",
+        "start": 1262.948,
+        "end": 2606.32
+      }
+    ],
+    "metadata": { ... }
+  }
+}
+```
+
+**Key fields:**
+- `media.chapters[].title` — Chapter name (set in UI)
+- `media.chapters[].start` — Chapter start time (seconds)
+- `media.chapters[].end` — Chapter end time (seconds)
+
 ### Step 4: Extract Metadata for File Sync
 
 Key metadata fields to sync to audio files:
@@ -192,25 +220,30 @@ Key metadata fields to sync to audio files:
 
 **Important:** FFmpeg cannot edit files in-place. You MUST write to a temporary file first, then rename.
 
+**Note on chapter titles:** Use chapter title from `media.chapters[].title` (set in audiobookshelf UI), NOT the filename. Filename may be generic like `chapter01.m4a`, but chapter title is descriptive like `01 鲁宾逊漂流记 01`.
+
 ```bash
 # Read current metadata
 ffprobe -i "chapter01.m4a" -show_entries format_tags -of default=noprint_wrappers=1
 
+# Chapter title from audiobookshelf (NOT filename)
+CHAPTER_TITLE="01 鲁宾逊漂流记 01"
+BOOK_TITLE="鲁宾逊漂流记"
+AUTHOR="丹尼尔·笛福"
+
 # Step 1: Write to temporary file (must use same extension for format detection)
 ffmpeg -i "chapter01.m4a" -c copy \
-  -metadata title="Chapter 1" \
-  -metadata artist="Author Name" \
-  -metadata album="Book Title" \
-  -metadata album_artist="Author Name" \
-  -metadata genre="Fiction" \
-  -metadata year="2024" \
-  -metadata track="1/12" \
+  -metadata title="$CHAPTER_TITLE" \
+  -metadata artist="$AUTHOR" \
+  -metadata album="$BOOK_TITLE" \
+  -metadata album_artist="$AUTHOR" \
   -y "chapter01.temp.m4a"
 
 # Step 2: Verify temp file was created successfully
 if [ -f "chapter01.temp.m4a" ]; then
   # Step 3: Replace original
   mv "chapter01.temp.m4a" "chapter01.m4a"
+  echo "Success: metadata updated"
 else
   echo "ERROR: Failed to create temp file"
   exit 1
@@ -351,7 +384,7 @@ verify_paths() {
 }
 ```
 
-### Updated Batch Sync with Path Translation
+### Batch Sync with Chapters and Path Translation
 
 ```bash
 #!/bin/bash
@@ -386,41 +419,80 @@ echo "$items" | jq -c '.results[]' | while read -r item; do
   full_item=$(curl -s "$SERVER/api/items/$item_id" \
     -H "Authorization: Bearer $TOKEN")
 
-  # Extract metadata
-  title=$(echo "$full_item" | jq -r '.media.metadata.title')
+  # Extract book-level metadata
+  book_title=$(echo "$full_item" | jq -r '.media.metadata.title')
   author=$(echo "$full_item" | jq -r '.media.metadata.authorName')
+  genre=$(echo "$full_item" | jq -r '.media.metadata.genres[0] // ""')
+  year=$(echo "$full_item" | jq -r '.media.metadata.publishedYear')
+
+  # Extract chapters array - use chapter title from audiobookshelf, NOT filename
+  chapters=$(echo "$full_item" | jq -c '.media.chapters // []')
+  num_chapters=$(echo "$chapters" | jq 'length')
+
+  echo "Processing: $book_title ($num_chapters chapters)"
 
   # Process each audio file
   echo "$full_item" | jq -c '.media.audioFiles[]' | while read -r audio_file; do
-    # Get API path
+    # Get file info
     api_path=$(echo "$audio_file" | jq -r '.metadata.path')
+    file_duration=$(echo "$audio_file" | jq -r '.duration')
+    file_start_time=$(echo "$audio_file" | jq -r '.startTime // 0')
 
     # Translate to local path
     local_path=$(translate_path "$api_path")
 
-    if [ -f "$local_path" ]; then
-      echo "Processing: $title"
-      echo "  API path: $api_path"
-      echo "  Local path: $local_path"
+    if [ ! -f "$local_path" ]; then
+      echo "  WARNING: File not found: $local_path"
+      continue
+    fi
 
-      # Get file extension for temp file
-      ext="${local_path##*.}"
-      temp_file="${local_path%.${ext}}.temp.${ext}"
+    # Find matching chapter by start time
+    # Chapters are sorted by start time, match by file start time
+    chapter_title=""
+    chapter_index=0
 
-      # Update metadata: write to temp file first, then rename
-      if ffmpeg -i "$local_path" -c copy \
-        -metadata title="$title" \
-        -metadata artist="$author" \
-        -y "$temp_file" 2>/dev/null; then
-        mv "$temp_file" "$local_path"
-        echo "  Success: metadata updated"
-      else
-        echo "  ERROR: failed to update metadata"
-        rm -f "$temp_file"
+    while [ $chapter_index -lt $num_chapters ]; do
+      chap_start=$(echo "$chapters" | jq -r ".[$chapter_index].start")
+      chap_end=$(echo "$chapters" | jq -r ".[$chapter_index].end")
+      chap_title=$(echo "$chapters" | jq -r ".[$chapter_index].title")
+
+      # Check if file start time falls within this chapter
+      if (( $(echo "$file_start_time >= $chap_start && $file_start_time < $chap_end" | bc -l) )); then
+        chapter_title="$chap_title"
+        break
       fi
+      chapter_index=$((chapter_index + 1))
+    done
+
+    # Fallback: use track number as chapter title if no match
+    if [ -z "$chapter_title" ]; then
+      track_num=$((chapter_index + 1))
+      chapter_title="Chapter $track_num"
+    fi
+
+    echo "  File: $(basename "$local_path")"
+    echo "  Chapter: $chapter_title (track $((chapter_index + 1)))"
+
+    # Get file extension for temp file
+    ext="${local_path##*.}"
+    temp_file="${local_path%.${ext}}.temp.${ext}"
+
+    # Update metadata: write to temp file first, then rename
+    # Use chapter title from audiobookshelf, NOT filename
+    if ffmpeg -i "$local_path" -c copy \
+      -metadata title="$chapter_title" \
+      -metadata artist="$author" \
+      -metadata album="$book_title" \
+      -metadata album_artist="$author" \
+      -metadata genre="$genre" \
+      -metadata year="$year" \
+      -metadata track="$((chapter_index + 1))" \
+      -y "$temp_file" 2>/dev/null; then
+      mv "$temp_file" "$local_path"
+      echo "  Success: metadata updated"
     else
-      echo "WARNING: File not found at translated path: $local_path"
-      echo "  Original API path: $api_path"
+      echo "  ERROR: failed to update metadata"
+      rm -f "$temp_file"
     fi
   done
 done
@@ -560,5 +632,6 @@ Since official API docs are outdated:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.0.2 | 2026-03-13 | Use chapter title from `media.chapters[].title` instead of filename |
 | 1.0.1 | 2026-03-12 | Add temp file requirement for ffmpeg writes (ffmpeg cannot edit in-place) |
 | 1.0.0 | 2026-03-12 | Initial release: API reference, metadata mapping, path prefix translation, deduplication |
