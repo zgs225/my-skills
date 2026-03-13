@@ -1,6 +1,6 @@
 ---
 name: audiobookshelf-metadata-sync
-version: 1.0.2
+version: 1.0.3
 description: Use when synchronizing audiobookshelf server metadata to local audio files, or when library item metadata and embedded file metadata are inconsistent
 ---
 
@@ -384,6 +384,23 @@ verify_paths() {
 }
 ```
 
+### File-Chapter Mapping Logic
+
+**For typical audiobooks (1 file = 1 chapter):**
+
+Files and chapters are both sorted by order. Match them by **index**:
+
+| audioFiles index | chapters index | Result |
+|-----------------|----------------|--------|
+| `audioFiles[0]` | `chapters[0]` | File 1 → Chapter 1 title |
+| `audioFiles[1]` | `chapters[1]` | File 2 → Chapter 2 title |
+| `audioFiles[i]` | `chapters[i]` | File i+1 → Chapter i+1 title |
+
+**Why index-based matching works:**
+- Audiobookshelf ensures `audioFiles` and `chapters` arrays are in the same order
+- Each audio file corresponds to exactly one chapter
+- No need for complex time-range calculations
+
 ### Batch Sync with Chapters and Path Translation
 
 ```bash
@@ -425,18 +442,19 @@ echo "$items" | jq -c '.results[]' | while read -r item; do
   genre=$(echo "$full_item" | jq -r '.media.metadata.genres[0] // ""')
   year=$(echo "$full_item" | jq -r '.media.metadata.publishedYear')
 
-  # Extract chapters array - use chapter title from audiobookshelf, NOT filename
+  # Extract chapters array
   chapters=$(echo "$full_item" | jq -c '.media.chapters // []')
   num_chapters=$(echo "$chapters" | jq 'length')
 
   echo "Processing: $book_title ($num_chapters chapters)"
 
-  # Process each audio file
-  echo "$full_item" | jq -c '.media.audioFiles[]' | while read -r audio_file; do
+  # Process each audio file with index-based chapter matching
+  # audioFiles[0] matches chapters[0], audioFiles[1] matches chapters[1], etc.
+  echo "$full_item" | jq -c '.media.audioFiles[]' | jq -s 'to_entries[]' | while read -r audio_file_entry; do
     # Get file info
+    file_index=$(echo "$audio_file_entry" | jq -r '.key')
+    audio_file=$(echo "$audio_file_entry" | jq -c '.value')
     api_path=$(echo "$audio_file" | jq -r '.metadata.path')
-    file_duration=$(echo "$audio_file" | jq -r '.duration')
-    file_start_time=$(echo "$audio_file" | jq -r '.startTime // 0')
 
     # Translate to local path
     local_path=$(translate_path "$api_path")
@@ -446,32 +464,19 @@ echo "$items" | jq -c '.results[]' | while read -r item; do
       continue
     fi
 
-    # Find matching chapter by start time
-    # Chapters are sorted by start time, match by file start time
+    # Get chapter title by index (simple 1:1 mapping)
     chapter_title=""
-    chapter_index=0
+    if [ "$file_index" -lt "$num_chapters" ]; then
+      chapter_title=$(echo "$chapters" | jq -r ".[$file_index].title")
+    fi
 
-    while [ $chapter_index -lt $num_chapters ]; do
-      chap_start=$(echo "$chapters" | jq -r ".[$chapter_index].start")
-      chap_end=$(echo "$chapters" | jq -r ".[$chapter_index].end")
-      chap_title=$(echo "$chapters" | jq -r ".[$chapter_index].title")
-
-      # Check if file start time falls within this chapter
-      if (( $(echo "$file_start_time >= $chap_start && $file_start_time < $chap_end" | bc -l) )); then
-        chapter_title="$chap_title"
-        break
-      fi
-      chapter_index=$((chapter_index + 1))
-    done
-
-    # Fallback: use track number as chapter title if no match
-    if [ -z "$chapter_title" ]; then
-      track_num=$((chapter_index + 1))
-      chapter_title="Chapter $track_num"
+    # Fallback: use generic chapter name if no match
+    if [ -z "$chapter_title" ] || [ "$chapter_title" = "null" ]; then
+      chapter_title="Chapter $((file_index + 1))"
     fi
 
     echo "  File: $(basename "$local_path")"
-    echo "  Chapter: $chapter_title (track $((chapter_index + 1)))"
+    echo "  Chapter: $chapter_title (track $((file_index + 1)))"
 
     # Get file extension for temp file
     ext="${local_path##*.}"
@@ -486,7 +491,7 @@ echo "$items" | jq -c '.results[]' | while read -r item; do
       -metadata album_artist="$author" \
       -metadata genre="$genre" \
       -metadata year="$year" \
-      -metadata track="$((chapter_index + 1))" \
+      -metadata track="$((file_index + 1))" \
       -y "$temp_file" 2>/dev/null; then
       mv "$temp_file" "$local_path"
       echo "  Success: metadata updated"
@@ -632,6 +637,7 @@ Since official API docs are outdated:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.0.3 | 2026-03-13 | Simplify file-chapter mapping: use index-based matching (1 file = 1 chapter) |
 | 1.0.2 | 2026-03-13 | Use chapter title from `media.chapters[].title` instead of filename |
 | 1.0.1 | 2026-03-12 | Add temp file requirement for ffmpeg writes (ffmpeg cannot edit in-place) |
 | 1.0.0 | 2026-03-12 | Initial release: API reference, metadata mapping, path prefix translation, deduplication |
